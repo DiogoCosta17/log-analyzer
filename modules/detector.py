@@ -246,22 +246,24 @@ class ThreatDetector:
         win_min = int(self.brute_window.total_seconds() // 60)
         for ip, times in ip_times.items():
             times.sort()
+            worst_count, worst_start = 0, times[0]
             for i, ts in enumerate(times):
                 end = ts + self.brute_window
                 count = sum(1 for t in times[i:] if t <= end)
-                if count >= self.brute_force_threshold:
-                    sev = Severity.CRITICAL if count >= 20 else Severity.HIGH
-                    threats.append(Threat(
-                        threat_type=ThreatType.BRUTE_FORCE,
-                        severity=sev,
-                        ip=ip,
-                        description=f"{label}: {count} {detail} within {win_min} minutes",
-                        evidence=[f"{count} events starting at {ts.isoformat()}"],
-                        count=count,
-                        first_seen=times[0],
-                        last_seen=times[-1],
-                    ))
-                    break
+                if count > worst_count:
+                    worst_count, worst_start = count, ts
+            if worst_count >= self.brute_force_threshold:
+                sev = Severity.CRITICAL if worst_count >= 20 else Severity.HIGH
+                threats.append(Threat(
+                    threat_type=ThreatType.BRUTE_FORCE,
+                    severity=sev,
+                    ip=ip,
+                    description=f"{label}: {worst_count} {detail} within {win_min} minutes",
+                    evidence=[f"{worst_count} events starting at {worst_start.isoformat()}"],
+                    count=worst_count,
+                    first_seen=times[0],
+                    last_seen=times[-1],
+                ))
         return threats
 
     # ── Endpoint scanning ─────────────────────────────────────────────────────
