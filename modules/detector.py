@@ -61,7 +61,7 @@ def _compile(patterns: List[str], flags: int = re.IGNORECASE) -> List[re.Pattern
 
 
 SQL_PATTERNS = _compile([
-    r"union\s+(?:all\s+)?select",
+    r"union\s+(?:all\s+)?select\b",
     r"'[^']*'\s+(?:or|and)\s+'[^']*'\s*=\s*'",
     r"\bexec(?:ute)?\s*\(",
     r"\bxp_cmdshell\b",
@@ -80,6 +80,8 @@ SQL_PATTERNS = _compile([
     r"char\s*\(\s*\d+",
     r"(?:%27|%3B|%2D%2D)",        # URL-encoded ' ; --
     r"(?:0x[0-9a-fA-F]{4,})",     # hex literals
+    r"convert\s*\(\s*int",        # MSSQL type conversion attacks
+    r"declare\s+@\w+",            # MSSQL variable declaration
 ])
 
 XSS_PATTERNS = _compile([
