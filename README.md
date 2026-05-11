@@ -5,6 +5,8 @@
 A CLI cybersecurity log analysis tool that detects threats in Apache, Nginx, SSH,
 syslog, and Windows Event logs.
 
+![demo](docs/demo.svg)
+
 ## Install
 
 ```bash

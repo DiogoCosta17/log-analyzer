@@ -26,6 +26,9 @@ env/
 *.log.gz
 *.log.bz2
 
+# Generated test logs folder
+test_logs/
+
 # Editor / OS noise
 .DS_Store
 Thumbs.db
