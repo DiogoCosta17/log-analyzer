@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Tool output — generated reports should not be committed
+*_report.json
+*_report.html
+*_suspicious_ips.csv
+
+# Log files — usually too large or sensitive for version control
+*.log
+*.log.gz
+*.log.bz2
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace

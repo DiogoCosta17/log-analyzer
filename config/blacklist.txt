@@ -1,0 +1,4 @@
+# Blacklisted IPs — any activity from these IPs is flagged CRITICAL.
+# Add known bad actors, Tor exit nodes, threat-intel IOCs, etc.
+# 198.51.100.1
+# 203.0.113.99

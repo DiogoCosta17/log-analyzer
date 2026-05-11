@@ -1,0 +1,6 @@
+# Whitelisted IPs — one per line.  Lines starting with # are ignored.
+# Example: your office IP, monitoring probes, trusted partners.
+# 203.0.113.10
+# 198.51.100.42
+127.0.0.1
+::1
