@@ -1,5 +1,7 @@
 # Log Analyzer
 
+![Tests](https://github.com/DiogoCosta17/log-analyzer/actions/workflows/tests.yml/badge.svg)
+
 A CLI cybersecurity log analysis tool that detects threats in Apache, Nginx, SSH,
 syslog, and Windows Event logs.
 
