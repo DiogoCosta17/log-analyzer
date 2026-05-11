@@ -55,7 +55,7 @@ class GeoIPLookup:
     _API = "http://ip-api.com/batch"
     _FIELDS = "status,country,countryCode,regionName,city,org,lat,lon,proxy,query"
     _BATCH = 100
-    _SLEEP = 1.5   # seconds between batches
+    _SLEEP = 1.5   # ip-api.com free tier: 45 req/min, 100 IPs/batch
 
     def __init__(self):
         self._cache: Dict[str, Optional[GeoInfo]] = {}
@@ -85,6 +85,12 @@ class GeoIPLookup:
                         )
                     else:
                         self._cache[ip] = None
+            except requests.Timeout:
+                for ip in batch:
+                    self._cache.setdefault(ip, None)
+            except requests.ConnectionError:
+                for ip in batch:
+                    self._cache.setdefault(ip, None)
             except Exception:
                 for ip in batch:
                     self._cache.setdefault(ip, None)
