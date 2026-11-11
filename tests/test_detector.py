@@ -360,3 +360,120 @@ class TestStatistics:
         entries = [_apache("1.1.1.1")] * 5 + [_apache("2.2.2.2")] * 3
         stats = detector.get_statistics(entries)
         assert stats["top_ips"][0][0] == "1.1.1.1"
+
+
+# ── Detection fixes (false positives / missed attacks) ───────────────────────
+
+class TestPayloadAccuracy:
+    @pytest.mark.parametrize("endpoint", [
+        "/search?q=men%27s+shoes",          # encoded apostrophe in normal text
+        "/authors?name=O%27Brien",
+        "/item?page1=1",                    # parameter name ending in 1
+        "/tx/0xabcdef12",                   # hex in a path, not an SQL value
+    ])
+    def test_normal_requests_are_not_sql_injection(self, endpoint):
+        assert not _make_detector().detect_sql_injection([_apache("1.2.3.4", endpoint)])
+
+    @pytest.mark.parametrize("endpoint", [
+        "/page?id=1%27%20OR%20%271%27%3D%271",   # 1' OR '1'='1
+        "/page?id=1'+or+1=1--",
+        "/user?id=1 OR 1=1",
+        "/page?id=0x41424344",
+    ])
+    def test_classic_sql_injection_still_detected(self, endpoint):
+        assert _make_detector().detect_sql_injection([_apache("1.2.3.4", endpoint)])
+
+    @pytest.mark.parametrize("endpoint", [
+        "/download?f=/home/user/.ssh/id_rsa",
+        "/x?f=C:\\Windows\\System32\\cmd.exe",
+        "/x?f=c:/windows/system32/drivers/etc/hosts",
+    ])
+    def test_traversal_targets_detected(self, endpoint):
+        assert _make_detector().detect_directory_traversal([_apache("1.2.3.4", endpoint)])
+
+    def test_payload_threat_records_first_and_last_seen(self):
+        t0 = datetime(2026, 5, 10, 10, 0, 0)
+        entries = [
+            _apache("1.2.3.4", "/q?id=1 UNION SELECT 1", ts=t0),
+            _apache("1.2.3.4", "/q?id=1 UNION SELECT 2", ts=t0 + timedelta(minutes=7)),
+        ]
+        (threat,) = _make_detector().detect_sql_injection(entries)
+        assert threat.first_seen == t0
+        assert threat.last_seen == t0 + timedelta(minutes=7)
+
+
+class TestAgentSeverity:
+    def test_attack_tool_is_medium(self):
+        (t,) = _make_detector().detect_suspicious_agents([_apache("1.2.3.4", agent="sqlmap/1.7")])
+        assert t.severity == Severity.MEDIUM
+
+    @pytest.mark.parametrize("agent", ["curl/8.4.0", "python-requests/2.31.0", "Go-http-client/1.1", "-"])
+    def test_generic_http_clients_are_low(self, agent):
+        (t,) = _make_detector().detect_suspicious_agents([_apache("1.2.3.4", agent=agent)])
+        assert t.severity == Severity.LOW
+
+    def test_tool_wins_when_an_ip_uses_both(self):
+        entries = [_apache("1.2.3.4", agent="curl/8.4.0"), _apache("1.2.3.4", agent="Nikto/2.1.6")]
+        (t,) = _make_detector().detect_suspicious_agents(entries)
+        assert t.severity == Severity.MEDIUM
+        assert t.count == 2
+
+
+# ── CIDR whitelist / blacklist ────────────────────────────────────────────────
+
+class TestCidrLists:
+    def test_blacklist_range_matches(self):
+        det = _make_detector(blacklist={"185.220.101.0/24"})
+        threats = det.detect_blacklisted_ips([_apache("185.220.101.77")])
+        assert threats and threats[0].severity == Severity.CRITICAL
+
+    def test_blacklist_range_does_not_match_outside(self):
+        det = _make_detector(blacklist={"185.220.101.0/24"})
+        assert not det.detect_blacklisted_ips([_apache("185.220.102.1")])
+
+    def test_whitelist_range_skips_ips(self):
+        det = _make_detector(whitelist={"10.0.0.0/8"})
+        entries = [_apache("10.1.2.3", "/q?id=1 UNION SELECT 1")]
+        assert not det.detect_all(entries)
+
+    def test_ipv6_range_and_bad_entries_are_safe(self):
+        det = _make_detector(blacklist={"2001:db8::/32", "not-a-network/99", "1.2.3.4"})
+        assert det.detect_blacklisted_ips([_apache("2001:db8::1")])
+        assert det.detect_blacklisted_ips([_apache("1.2.3.4")])
+        assert not det.detect_blacklisted_ips([_apache("unknown")])
+
+
+# ── Sliding windows (linear-time versions) ────────────────────────────────────
+
+class TestSlidingWindows:
+    def test_brute_force_counts_only_inside_window(self):
+        t0 = datetime(2026, 5, 10, 10, 0, 0)
+        # 4 failures, a long gap, then 4 more: never 5 inside a 10-minute window.
+        times = [t0 + timedelta(minutes=m) for m in (0, 1, 2, 3, 30, 31, 32, 33)]
+        det = _make_detector(brute_force_threshold=5, brute_force_window_min=10)
+        assert not det.detect_brute_force([_ssh("6.6.6.6", "failure", ts=t) for t in times])
+
+    def test_brute_force_window_edge_is_inclusive(self):
+        t0 = datetime(2026, 5, 10, 10, 0, 0)
+        times = [t0, t0 + timedelta(minutes=10)]
+        det = _make_detector(brute_force_threshold=2, brute_force_window_min=10)
+        (t,) = det.detect_brute_force([_ssh("6.6.6.6", "failure", ts=t) for t in times])
+        assert t.count == 2
+
+    def test_scan_needs_unique_paths_inside_window(self):
+        t0 = datetime(2026, 5, 10, 10, 0, 0)
+        spread = [_apache("7.7.7.7", f"/p{i}", ts=t0 + timedelta(minutes=i)) for i in range(25)]
+        det = _make_detector(scan_threshold=20, scan_window_min=5)
+        assert not det.detect_endpoint_scan(spread)
+        burst = [_apache("7.7.7.7", f"/p{i}", ts=t0 + timedelta(seconds=i)) for i in range(25)]
+        (t,) = det.detect_endpoint_scan(burst)
+        assert t.count >= 20
+
+    def test_brute_force_100k_failures_is_fast(self):
+        import time
+        t0 = datetime(2026, 5, 10, 10, 0, 0)
+        entries = [_ssh("6.6.6.6", "failure", ts=t0 + timedelta(seconds=i)) for i in range(100_000)]
+        start = time.perf_counter()
+        (t,) = _make_detector().detect_brute_force(entries)
+        assert time.perf_counter() - start < 2.0
+        assert t.count == 601   # 10-minute window, one failure per second, both ends included

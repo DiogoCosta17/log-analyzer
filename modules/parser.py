@@ -14,12 +14,11 @@ Compressed files (.gz, .bz2) are transparently decompressed.
 import re
 import gzip
 import bz2
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from urllib.parse import unquote
 
 
 class LogFormat(Enum):
@@ -111,27 +110,28 @@ def _parse_apache_ts(raw: str) -> Optional[datetime]:
         return None
 
 
-def _parse_syslog_ts(month: str, day: str, time_s: str) -> Optional[datetime]:
+def _parse_syslog_ts(month: str, day: str, time_s: str,
+                     now: Optional[datetime] = None) -> Optional[datetime]:
+    """Syslog (RFC 3164) timestamps have no year: assume the current one, unless that puts the
+    entry more than a day in the future (e.g. December logs read in January) - then it is last year's."""
+    now = now or datetime.now()
     try:
-        year = datetime.now().year
-        return datetime.strptime(f"{year} {month} {day.zfill(2)} {time_s}", "%Y %b %d %H:%M:%S")
+        ts = datetime.strptime(f"{now.year} {month} {day.zfill(2)} {time_s}", "%Y %b %d %H:%M:%S")
     except ValueError:
+        # 29 February in a non-leap current year: it can only be from the last leap year.
+        for year in range(now.year - 1, now.year - 4, -1):
+            try:
+                return datetime.strptime(f"{year} {month} {day.zfill(2)} {time_s}",
+                                         "%Y %b %d %H:%M:%S")
+            except ValueError:
+                continue
         return None
-
-
-def _parse_iso_ts(raw: str) -> Optional[datetime]:
-    try:
-        raw = raw.replace("T", " ").replace("Z", "").split("+")[0].split("-")[0:3]
-        # Fallback: just use fromisoformat on the cleaned string
-        cleaned = raw if isinstance(raw, str) else None
-    except Exception:
-        return None
-    if not cleaned:
-        return None
-    try:
-        return datetime.fromisoformat(cleaned)
-    except ValueError:
-        return None
+    if ts > now + timedelta(days=1):
+        try:
+            ts = ts.replace(year=ts.year - 1)
+        except ValueError:
+            return None
+    return ts
 
 
 def _iso_ts(raw: str) -> Optional[datetime]:
@@ -148,6 +148,13 @@ def _iso_ts(raw: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
+
+
+_FORMAT_HINTS = {
+    "apache": LogFormat.APACHE, "nginx": LogFormat.NGINX,
+    "ssh": LogFormat.SSH, "syslog": LogFormat.SYSLOG,
+    "windows": LogFormat.WINDOWS,
+}
 
 
 # ── Main parser class ─────────────────────────────────────────────────────────
@@ -335,15 +342,10 @@ class LogParser:
         with self._open(path) as fh:
             lines = fh.readlines()
 
-        fmt_map = {
-            "apache": LogFormat.APACHE, "nginx": LogFormat.NGINX,
-            "ssh": LogFormat.SSH, "syslog": LogFormat.SYSLOG,
-            "windows": LogFormat.WINDOWS,
-        }
         if self._format_hint == "auto":
             self._detected_format = self.detect_format(lines[:50])
         else:
-            self._detected_format = fmt_map.get(self._format_hint, LogFormat.UNKNOWN)
+            self._detected_format = _FORMAT_HINTS.get(self._format_hint, LogFormat.UNKNOWN)
 
         entries: List[LogEntry] = []
         for i, raw in enumerate(lines, 1):
@@ -360,15 +362,10 @@ class LogParser:
         with self._open(path) as fh:
             sample = [fh.readline() for _ in range(50)]
 
-        fmt_map = {
-            "apache": LogFormat.APACHE, "nginx": LogFormat.NGINX,
-            "ssh": LogFormat.SSH, "syslog": LogFormat.SYSLOG,
-            "windows": LogFormat.WINDOWS,
-        }
         if self._format_hint == "auto":
             self._detected_format = self.detect_format(sample)
         else:
-            self._detected_format = fmt_map.get(self._format_hint, LogFormat.UNKNOWN)
+            self._detected_format = _FORMAT_HINTS.get(self._format_hint, LogFormat.UNKNOWN)
 
         with self._open(path) as fh:
             for i, raw in enumerate(fh, 1):

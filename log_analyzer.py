@@ -14,6 +14,9 @@ Usage examples
   python log_analyzer.py --file access.log --diff access_yesterday.log
   python log_analyzer.py --file access.log --watch
   python log_analyzer.py --file access.log --whitelist config/whitelist.txt
+  python log_analyzer.py --file access.log --no-geo --fail-on high   # exit code 2 on HIGH+
+
+Exit codes: 0 = finished (no threat at or above --fail-on), 1 = error, 2 = threats found.
 """
 
 import sys
@@ -28,6 +31,7 @@ from typing import Optional, Set, Tuple
 
 import click
 from rich.console import Console
+from rich.markup import escape
 
 from modules.parser import LogParser, LogFormat
 from modules.detector import ThreatDetector
@@ -37,6 +41,9 @@ from modules.watcher import LogWatcher
 
 
 console = Console(legacy_windows=False)
+
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+EXIT_THREATS_FOUND = 2
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -50,19 +57,22 @@ def _load_ip_list(path: Optional[str]) -> Set[str]:
             for line in Path(path).read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.strip().startswith("#")
         }
-        console.print(f"[dim]Loaded {len(ips)} IPs from {path}[/dim]")
+        console.print(f"[dim]Loaded {len(ips)} IPs from {escape(str(path))}[/dim]")
         return ips
     except FileNotFoundError:
-        console.print(f"[yellow]Warning: IP list not found: {path}[/yellow]")
+        console.print(f"[yellow]Warning: IP list not found: {escape(str(path))}[/yellow]")
         return set()
 
 
 def _parse_hours(hours_str: str) -> Tuple[int, int]:
     try:
         parts = hours_str.strip().split("-")
-        return int(parts[0]), int(parts[1])
+        start, end = int(parts[0]), int(parts[1])
+        if not (0 <= start <= 23 and 0 <= end <= 23):
+            raise ValueError("hours must be between 0 and 23")
+        return start, end
     except (ValueError, IndexError):
-        console.print(f"[yellow]Invalid --suspicious-hours '{hours_str}', using 0-6[/yellow]")
+        console.print(f"[yellow]Invalid --suspicious-hours '{escape(hours_str)}', using 0-6[/yellow]")
         return 0, 6
 
 
@@ -99,15 +109,18 @@ def _stem(file_path: str, output: Optional[str]) -> str:
 @click.option("--top-n", default=10, show_default=True, type=int,
               help="Number of top IPs / endpoints to display.")
 @click.option("--whitelist", "whitelist_file", default=None,
-              help="File containing whitelisted IPs (one per line, # comments ok).")
+              help="File with whitelisted IPs or CIDR ranges (one per line, # comments ok).")
 @click.option("--blacklist", "blacklist_file", default=None,
-              help="File containing blacklisted IPs (flagged as CRITICAL).")
+              help="File with blacklisted IPs or CIDR ranges (flagged as CRITICAL).")
 @click.option("--diff", "diff_file", default=None,
               help="Second log file to compare against the primary file.")
 @click.option("--no-geo", is_flag=True, default=False,
               help="Skip geolocation lookups (faster, no internet required).")
 @click.option("--watch", "-w", is_flag=True, default=False,
               help="Watch mode: tail the file and alert on new threats in real time.")
+@click.option("--fail-on", "fail_on", default="none", show_default=True,
+              type=click.Choice(["none", "low", "medium", "high", "critical"]),
+              help="Exit with code 2 if any threat has this severity or higher (for scripts/CI).")
 def main(
     log_file: str,
     log_format: str,
@@ -124,12 +137,16 @@ def main(
     diff_file: Optional[str],
     no_geo: bool,
     watch: bool,
+    fail_on: str,
 ) -> None:
     """Analyze security logs and detect threats."""
 
     # Validate file exists
     if not Path(log_file).exists():
-        console.print(f"[red]File not found:[/red] {log_file}")
+        console.print(f"[red]File not found:[/red] {escape(log_file)}")
+        sys.exit(1)
+    if not Path(log_file).is_file():
+        console.print(f"[red]Not a file:[/red] {escape(log_file)}")
         sys.exit(1)
 
     whitelist = _load_ip_list(whitelist_file)
@@ -150,6 +167,9 @@ def main(
 
     # ── Watch mode ────────────────────────────────────────────────────────────
     if watch:
+        if Path(log_file).suffix in (".gz", ".bz2"):
+            console.print("[red]Watch mode needs a plain text log, not a compressed file.[/red]")
+            sys.exit(1)
         console.print("[dim]Detecting log format from file head…[/dim]")
         with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
             sample = [fh.readline() for _ in range(20)]
@@ -161,7 +181,7 @@ def main(
         return
 
     # ── Full analysis ─────────────────────────────────────────────────────────
-    console.print(f"[dim]Parsing {log_file} …[/dim]")
+    console.print(f"[dim]Parsing {escape(log_file)} …[/dim]")
     entries = parser.parse_file(log_file)
 
     if not entries:
@@ -192,7 +212,7 @@ def main(
             try:
                 geo_data = GeoIPLookup().lookup_batch(lookup_ips)
             except Exception as exc:
-                console.print(f"[yellow]Geolocation unavailable: {exc}[/yellow]")
+                console.print(f"[yellow]Geolocation unavailable: {escape(str(exc))}[/yellow]")
 
     # ── Terminal report ───────────────────────────────────────────────────────
     reporter.print_full_report(
@@ -206,10 +226,10 @@ def main(
 
     # ── Diff ──────────────────────────────────────────────────────────────────
     if diff_file:
-        if not Path(diff_file).exists():
-            console.print(f"[red]Diff file not found:[/red] {diff_file}")
+        if not Path(diff_file).is_file():
+            console.print(f"[red]Diff file not found:[/red] {escape(diff_file)}")
         else:
-            console.print(f"\n[dim]Parsing {diff_file} for comparison…[/dim]")
+            console.print(f"\n[dim]Parsing {escape(diff_file)} for comparison…[/dim]")
             parser2 = LogParser(log_format=log_format)
             entries2 = parser2.parse_file(diff_file)
             threats2 = detector.detect_all(entries2)
@@ -219,6 +239,7 @@ def main(
     # ── Exports ───────────────────────────────────────────────────────────────
     if exports:
         base = _stem(log_file, output)
+        Path(base).parent.mkdir(parents=True, exist_ok=True)
         for fmt in exports:
             if fmt == "json":
                 reporter.export_json(threats, stats, f"{base}_report.json", geo_data)
@@ -229,6 +250,12 @@ def main(
                     threats, stats, detected_fmt, log_file,
                     f"{base}_report.html", geo_data,
                 )
+
+    # ── Exit code for automation ──────────────────────────────────────────────
+    if fail_on != "none":
+        limit = _SEVERITY_RANK[fail_on]
+        if any(_SEVERITY_RANK[t.severity.value.lower()] >= limit for t in threats):
+            sys.exit(EXIT_THREATS_FOUND)
 
 
 if __name__ == "__main__":

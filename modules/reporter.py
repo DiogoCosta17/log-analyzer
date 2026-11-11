@@ -10,16 +10,15 @@ import html
 import json
 from collections import Counter
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
-from .detector import Severity, Threat, ThreatType
+from .detector import Severity, Threat
 from .parser import LogEntry, LogFormat
 
 
@@ -38,6 +37,14 @@ _HTML_BADGE: Dict[str, str] = {
     "HIGH":     '<span class="badge high">HIGH</span>',
     "CRITICAL": '<span class="badge critical">CRITICAL</span>',
 }
+
+
+def _csv_cell(value):
+    """Stop spreadsheet formula injection: a cell that starts with = + - @ (or a tab/CR) is run
+    as a formula by Excel/LibreOffice. Log data is attacker-controlled, so prefix it with '."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
 
 
 def _fmt_dt(dt: Optional[datetime]) -> str:
@@ -63,7 +70,7 @@ class Reporter:
         ts = stats["timespan"]
         dur = _duration(ts["start"], ts["end"])
         body = (
-            f"[bold]File:[/bold]          {file_path}\n"
+            f"[bold]File:[/bold]          {escape(file_path)}\n"
             f"[bold]Format:[/bold]        {log_format.value.upper()}\n"
             f"[bold]Time range:[/bold]    {_fmt_dt(ts['start'])}  ->  {_fmt_dt(ts['end'])}{dur}\n"
             f"[bold]Total requests:[/bold] [cyan]{stats['total_requests']:,}[/cyan]\n"
@@ -87,11 +94,11 @@ class Reporter:
         for i, (ip, count) in enumerate(top_ips, 1):
             geo = (geo_data or {}).get(ip)
             if geo_data:
-                loc = f"{geo.city}, {geo.country}" if geo else "–"
-                org = geo.org if geo else "–"
-                table.add_row(str(i), ip, f"{count:,}", loc, org)
+                loc = escape(f"{geo.city}, {geo.country}") if geo else "–"
+                org = escape(geo.org) if geo else "–"
+                table.add_row(str(i), escape(ip), f"{count:,}", loc, org)
             else:
-                table.add_row(str(i), ip, f"{count:,}")
+                table.add_row(str(i), escape(ip), f"{count:,}")
 
         self.console.print(table)
 
@@ -104,7 +111,7 @@ class Reporter:
         table.add_column("Requests", justify="right", style="bold white")
         for i, (ep, count) in enumerate(top_endpoints, 1):
             ep_disp = (ep[:90] + "…") if len(ep) > 90 else ep
-            table.add_row(str(i), ep_disp, f"{count:,}")
+            table.add_row(str(i), escape(ep_disp), f"{count:,}")
         self.console.print(table)
 
     def print_threats(self, threats: List[Threat]) -> None:
@@ -137,8 +144,8 @@ class Reporter:
                 table.add_row(
                     f"[{color}]{t.severity.value}[/{color}]",
                     t.threat_type.value.replace("_", " ").title(),
-                    t.ip or "–",
-                    t.description,
+                    escape(t.ip or "–"),
+                    escape(t.description),
                     str(t.count),
                 )
         self.console.print(table)
@@ -149,14 +156,14 @@ class Reporter:
             for t in critical_high[:10]:
                 color = _SEV_COLOR[t.severity]
                 self.console.print(
-                    f"\n  [{color}][{t.severity.value}][/{color}] [bold]{t.description}[/bold]"
+                    f"\n  [{color}]\\[{t.severity.value}][/{color}] [bold]{escape(t.description)}[/bold]"
                 )
                 if t.ip:
-                    self.console.print(f"  IP:  [cyan]{t.ip}[/cyan]")
+                    self.console.print(f"  IP:  [cyan]{escape(t.ip)}[/cyan]")
                 if t.first_seen:
                     self.console.print(f"  Window: {_fmt_dt(t.first_seen)} -> {_fmt_dt(t.last_seen)}")
                 for ev in t.evidence[:3]:
-                    self.console.print(f"    • {ev[:130]}")
+                    self.console.print(f"    • {escape(ev[:130])}")
 
     def print_full_report(
         self,
@@ -188,7 +195,7 @@ class Reporter:
         file1: str, file2: str,
     ) -> None:
         self.console.rule("[bold]Log Diff[/bold]")
-        self.console.print(f"  [cyan]A[/cyan] {file1}\n  [cyan]B[/cyan] {file2}\n")
+        self.console.print(f"  [cyan]A[/cyan] {escape(file1)}\n  [cyan]B[/cyan] {escape(file2)}\n")
 
         # IP changes
         ips1 = {ip for ip, _ in stats1["top_ips"]}
@@ -201,9 +208,9 @@ class Reporter:
             tbl.add_column("Change", width=8)
             tbl.add_column("IP")
             for ip in sorted(new_ips):
-                tbl.add_row("[green]+ NEW[/green]", ip)
+                tbl.add_row("[green]+ NEW[/green]", escape(ip))
             for ip in sorted(gone_ips):
-                tbl.add_row("[red]- GONE[/red]", ip)
+                tbl.add_row("[red]- GONE[/red]", escape(ip))
             self.console.print(tbl)
 
         # Threat type comparison
@@ -287,7 +294,7 @@ class Reporter:
         }
         with open(output_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
-        self.console.print(f"[green]JSON exported ->[/green] {output_path}")
+        self.console.print(f"[green]JSON exported ->[/green] {escape(output_path)}")
 
     # ── CSV export ────────────────────────────────────────────────────────────
 
@@ -318,7 +325,7 @@ class Reporter:
                     order = {s: i for i, s in enumerate(_SEV_ORDER)}
                     max_sev = min(tlist, key=lambda t: order[t.severity]).severity.value
                 geo = (geo_data or {}).get(ip)
-                w.writerow([
+                w.writerow([_csv_cell(v) for v in (
                     ip,
                     ip_counts.get(ip, 0),
                     types,
@@ -328,9 +335,9 @@ class Reporter:
                     geo.city if geo else "",
                     geo.org if geo else "",
                     geo.is_proxy if geo else "",
-                ])
+                )])
 
-        self.console.print(f"[green]CSV exported ->[/green] {output_path}")
+        self.console.print(f"[green]CSV exported ->[/green] {escape(output_path)}")
 
     # ── HTML export ───────────────────────────────────────────────────────────
 
@@ -470,4 +477,4 @@ footer{{text-align:center;margin-top:30px;color:#6e7681;font-size:.8rem}}
 
         with open(output_path, "w", encoding="utf-8") as fh:
             fh.write(page)
-        self.console.print(f"[green]HTML report ->[/green] {output_path}")
+        self.console.print(f"[green]HTML report ->[/green] {escape(output_path)}")

@@ -1,37 +1,30 @@
 """
 IP geolocation via the free ip-api.com batch endpoint (no API key required).
 
-Private / loopback addresses are skipped automatically.
+Private, loopback and non-IP values are skipped automatically.
+Note: the free ip-api.com tier only offers HTTP, so the IPs travel unencrypted; use --no-geo
+for sensitive logs.
 Results are cached in-process to avoid redundant requests.
 The batch API is limited to 100 IPs per request with a 45-req/min rate limit;
 we add a short sleep between batches to stay within limits.
 """
 
-import re
+import ipaddress
 import time
 import requests
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
 
-# RFC 1918 / loopback / link-local ranges
-_PRIVATE_RE = re.compile(
-    r'^(?:'
-    r'10\.\d+\.\d+\.\d+'
-    r'|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+'
-    r'|192\.168\.\d+\.\d+'
-    r'|127\.\d+\.\d+\.\d+'
-    r'|169\.254\.\d+\.\d+'
-    r'|::1'
-    r'|fc[0-9a-f]{2}:'
-    r'|fe[89ab][0-9a-f]:'
-    r')$',
-    re.IGNORECASE,
-)
-
-
 def is_private(ip: str) -> bool:
-    return bool(_PRIVATE_RE.match(ip))
+    """True for anything that is not a public, routable IP address: private ranges, loopback,
+    link-local, reserved, multicast - and strings that are not IP addresses at all.
+    Only public IPs are ever sent to the geolocation service."""
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except (ValueError, AttributeError):
+        return True
+    return not addr.is_global or addr.is_multicast
 
 
 @dataclass

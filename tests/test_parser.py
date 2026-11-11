@@ -1,8 +1,7 @@
 """Tests for log format detection and parsing."""
 
-import pytest
 from datetime import datetime
-from modules.parser import LogParser, LogFormat, LogEntry
+from modules.parser import LogParser, LogFormat, _parse_syslog_ts
 
 
 # ── Sample log lines ──────────────────────────────────────────────────────────
@@ -192,3 +191,22 @@ class TestParseFile:
         parser = LogParser()
         parser.parse_file(str(log))
         assert parser._detected_format == LogFormat.SSH
+
+
+# ── Syslog timestamps have no year ────────────────────────────────────────────
+
+class TestSyslogYear:
+    def test_uses_current_year(self):
+        ts = _parse_syslog_ts("Mar", "5", "10:00:00", now=datetime(2026, 6, 1))
+        assert ts == datetime(2026, 3, 5, 10, 0, 0)
+
+    def test_december_log_read_in_january_is_last_year(self):
+        ts = _parse_syslog_ts("Dec", "31", "23:59:00", now=datetime(2027, 1, 2, 9, 0))
+        assert ts == datetime(2026, 12, 31, 23, 59, 0)
+
+    def test_leap_day_in_non_leap_year(self):
+        ts = _parse_syslog_ts("Feb", "29", "12:00:00", now=datetime(2027, 3, 1))
+        assert ts == datetime(2024, 2, 29, 12, 0, 0)
+
+    def test_invalid_date_is_none(self):
+        assert _parse_syslog_ts("Foo", "1", "10:00:00") is None

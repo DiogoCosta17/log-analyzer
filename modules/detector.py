@@ -11,11 +11,12 @@ Threat severity ladder:
   CRITICAL – confirmed attack pattern or blacklisted actor
 """
 
+import ipaddress
 import re
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from typing import List, Dict, Optional, Tuple, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import unquote
 
@@ -74,12 +75,12 @@ SQL_PATTERNS = _compile([
     r"\boutfile\b",
     r"information_schema",
     r"\bsysobjects\b|\bsyscolumns\b",
-    r"1\s*=\s*1\b",
+    r"\b1\s*=\s*1\b",               # tautology (not "page1=1")
     r"'[^']*'\s*=\s*'[^']*'",
+    r"'\s*(?:or|and)\s+'?\w+'?\s*=\s*'?\w",   # ' OR '1'='1 / ' or 1=1
     r"(?:--\s*$|;\s*--)",
     r"char\s*\(\s*\d+",
-    r"(?:%27|%3B|%2D%2D)",        # URL-encoded ' ; --
-    r"(?:0x[0-9a-fA-F]{4,})",     # hex literals
+    r"(?:=|\s|\()0x[0-9a-fA-F]{4,}",  # hex literals used as values
     r"convert\s*\(\s*int",        # MSSQL type conversion attacks
     r"declare\s+@\w+",            # MSSQL variable declaration
 ])
@@ -109,12 +110,13 @@ TRAVERSAL_PATTERNS = _compile([
     r"/etc/(?:passwd|shadow|hosts|sudoers)",
     r"/proc/self/",
     r"c:[/\\](?:windows|users|program)",
-    r"\\\\system32\\\\",
+    r"[/\\]system32[/\\]",
     r"(?:win|boot|system)\.ini",
-    r"\\.ssh/(?:authorized_keys|id_rsa)",
+    r"/\.ssh/(?:authorized_keys|id_rsa|id_ed25519)",
 ])
 
-SCANNER_AGENT_PATTERNS = _compile([
+# Offensive security tools: a strong sign of an attack or a scan.
+ATTACK_TOOL_AGENT_PATTERNS = _compile([
     r"\bnikto\b",
     r"\bsqlmap\b",
     r"\bnmap\b",
@@ -132,15 +134,21 @@ SCANNER_AGENT_PATTERNS = _compile([
     r"\bappscan\b",
     r"\bburp\b",
     r"\bzgrab\b",
+    r"\bshodan\b",
     r"\bscanner\b",
     r"\bexploit\b",
+])
+
+# Generic HTTP clients and empty agents: often scripts, but also health checks and APIs.
+AUTOMATION_AGENT_PATTERNS = _compile([
     r"\blibwww-perl\b",
     r"python-requests/",
     r"go-http-client/",
     r"^curl/\d",
-    r"^-$",                         # blank or dash user agent
-    r"(?i)masscan|zgrab|shodan",
+    r"^-?$",                        # empty or dash user agent
 ])
+
+SCANNER_AGENT_PATTERNS = ATTACK_TOOL_AGENT_PATTERNS + AUTOMATION_AGENT_PATTERNS
 
 
 def _match_any(text: str, patterns: List[re.Pattern]) -> Optional[str]:
@@ -154,13 +162,36 @@ def _match_any(text: str, patterns: List[re.Pattern]) -> Optional[str]:
     return None
 
 
-def _matches(text: str, patterns: List[re.Pattern]) -> List[str]:
-    decoded = unquote(text)
-    hits = []
-    for p in patterns:
-        if p.search(decoded) or p.search(text):
-            hits.append(p.pattern)
-    return hits
+class _IPSet:
+    """Exact IPs plus CIDR ranges (e.g. 10.0.0.0/8) loaded from a whitelist/blacklist."""
+
+    def __init__(self, items: Optional[Set[str]] = None):
+        self.exact: Set[str] = set()
+        self.networks: List = []
+        for item in items or set():
+            item = item.strip()
+            if not item:
+                continue
+            if "/" in item:
+                try:
+                    self.networks.append(ipaddress.ip_network(item, strict=False))
+                    continue
+                except ValueError:
+                    pass
+            self.exact.add(item)
+
+    def __contains__(self, ip: Optional[str]) -> bool:
+        if not ip:
+            return False
+        if ip in self.exact:
+            return True
+        if not self.networks:
+            return False
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr.version == net.version and addr in net for net in self.networks)
 
 
 # ── Detector ──────────────────────────────────────────────────────────────────
@@ -187,9 +218,11 @@ class ThreatDetector:
         self.min_error_count = min_error_count
         self.whitelist: Set[str] = whitelist or set()
         self.blacklist: Set[str] = blacklist or set()
+        self._white = _IPSet(self.whitelist)
+        self._black = _IPSet(self.blacklist)
 
     def _skip(self, ip: Optional[str]) -> bool:
-        return bool(ip and ip in self.whitelist)
+        return ip in self._white
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -248,10 +281,16 @@ class ThreatDetector:
         win_min = int(self.brute_window.total_seconds() // 60)
         for ip, times in ip_times.items():
             times.sort()
+            # Sliding window with two pointers: O(n) per IP instead of O(n²).
             worst_count, worst_start = 0, times[0]
+            j = 0
             for i, ts in enumerate(times):
                 end = ts + self.brute_window
-                count = sum(1 for t in times[i:] if t <= end)
+                if j < i:
+                    j = i
+                while j < len(times) and times[j] <= end:
+                    j += 1
+                count = j - i
                 if count > worst_count:
                     worst_count, worst_start = count, ts
             if worst_count >= self.brute_force_threshold:
@@ -285,13 +324,18 @@ class ThreatDetector:
             timed: List[Tuple[datetime, str]] = sorted(
                 (ts, ep) for ep, times in ep_map.items() for ts in times
             )
+            # Sliding window with two pointers and a running count of paths in the window.
+            in_window: Counter = Counter()
+            j = 0
             for i, (ts, _) in enumerate(timed):
                 end = ts + self.scan_window
-                window = [(t, ep) for t, ep in timed[i:] if t <= end]
-                unique = len({ep for _, ep in window})
+                while j < len(timed) and timed[j][0] <= end:
+                    in_window[timed[j][1]] += 1
+                    j += 1
+                unique = len(in_window)
                 if unique >= self.scan_threshold:
                     sev = Severity.HIGH if unique >= 50 else Severity.MEDIUM
-                    sample = list({ep for _, ep in window})[:5]
+                    sample = list(in_window)[:5]
                     threats.append(Threat(
                         threat_type=ThreatType.ENDPOINT_SCAN,
                         severity=sev,
@@ -303,6 +347,11 @@ class ThreatDetector:
                         last_seen=timed[-1][0],
                     ))
                     break
+                # The window moves on: drop the request at its start.
+                leaving = timed[i][1]
+                in_window[leaving] -= 1
+                if not in_window[leaving]:
+                    del in_window[leaving]
         return threats
 
     # ── Injection / payload detection ─────────────────────────────────────────
@@ -316,6 +365,7 @@ class ThreatDetector:
         label: str,
     ) -> List[Threat]:
         ip_hits: Dict[str, List[str]] = defaultdict(list)
+        ip_times: Dict[str, List[datetime]] = defaultdict(list)
         for e in entries:
             targets = [t for t in (e.endpoint, e.message) if t]
             for target in targets:
@@ -323,9 +373,12 @@ class ThreatDetector:
                 if hit:
                     ip = e.ip or "unknown"
                     ip_hits[ip].append(target[:200])
+                    if e.timestamp:
+                        ip_times[ip].append(e.timestamp)
                     break
         threats = []
         for ip, samples in ip_hits.items():
+            times = ip_times.get(ip)
             threats.append(Threat(
                 threat_type=threat_type,
                 severity=severity,
@@ -333,8 +386,8 @@ class ThreatDetector:
                 description=f"{label}: {len(samples)} malicious request(s) detected",
                 evidence=samples[:3],
                 count=len(samples),
-                first_seen=None,
-                last_seen=None,
+                first_seen=min(times) if times else None,
+                last_seen=max(times) if times else None,
             ))
         return threats
 
@@ -357,24 +410,36 @@ class ThreatDetector:
     # ── Suspicious user agents ────────────────────────────────────────────────
 
     def detect_suspicious_agents(self, entries: List[LogEntry]) -> List[Threat]:
+        """Attack tools (nikto, sqlmap…) are MEDIUM; generic HTTP clients (curl, python-requests…)
+        are only LOW, because health checks and API integrations use them too."""
         ip_agents: Dict[str, Set[str]] = defaultdict(set)
+        ip_tools: Set[str] = set()
         for e in entries:
-            if e.user_agent and e.ip and _match_any(e.user_agent, SCANNER_AGENT_PATTERNS):
+            if e.user_agent is None or not e.ip:
+                continue
+            if _match_any(e.user_agent, ATTACK_TOOL_AGENT_PATTERNS):
                 ip_agents[e.ip].add(e.user_agent[:120])
+                ip_tools.add(e.ip)
+            elif _match_any(e.user_agent, AUTOMATION_AGENT_PATTERNS):
+                ip_agents[e.ip].add(e.user_agent[:120] or "(empty)")
 
-        return [
-            Threat(
+        threats = []
+        for ip, agents in ip_agents.items():
+            is_tool = ip in ip_tools
+            threats.append(Threat(
                 threat_type=ThreatType.SUSPICIOUS_AGENT,
-                severity=Severity.MEDIUM,
+                severity=Severity.MEDIUM if is_tool else Severity.LOW,
                 ip=ip,
-                description=f"Scanner/bot user-agent detected ({len(agents)} distinct agent(s))",
+                description=(
+                    f"Attack tool user-agent detected ({len(agents)} distinct agent(s))" if is_tool
+                    else f"Scripted HTTP client user-agent ({len(agents)} distinct agent(s))"
+                ),
                 evidence=sorted(agents)[:3],
                 count=len(agents),
                 first_seen=None,
                 last_seen=None,
-            )
-            for ip, agents in ip_agents.items()
-        ]
+            ))
+        return threats
 
     # ── High request rate ─────────────────────────────────────────────────────
 
@@ -461,7 +526,7 @@ class ThreatDetector:
 
     def detect_blacklisted_ips(self, entries: List[LogEntry]) -> List[Threat]:
         counts: Counter = Counter(
-            e.ip for e in entries if e.ip and e.ip in self.blacklist
+            e.ip for e in entries if e.ip and e.ip in self._black
         )
         return [
             Threat(
