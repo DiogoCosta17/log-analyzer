@@ -221,5 +221,5 @@ pytest tests/test_performance.py --run-slow   # 100k-line performance tests
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - Windows 10 / Linux / macOS
